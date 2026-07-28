@@ -16,6 +16,11 @@ CSV 为长表格式，一行一轮，必须包含「对话ID」「轮次」「�
 
 某一轮失败时，该对话的后续轮次不再发送（上下文已断），会标记为跳过。
 
+结果是**边跑边落盘**：每个对话一跑完就追加写入输出 CSV 并 fsync，中途 Ctrl+C
+或进程被杀，已完成的对话都还在文件里。Ctrl+C 会取消尚未开始的对话，进行中的
+对话在当前这一轮结束后停下，其已完成轮次同样会写入。全部跑完后文件会按
+(对话ID, 轮次) 重排一次；中断的情况下文件保持完成顺序。
+
 用法：
     python online_test/multi_turn_test.py
     python online_test/multi_turn_test.py --csv data/question_multi_turn.csv --max_workers 4
@@ -25,6 +30,7 @@ import argparse
 import csv
 import os
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, asdict
@@ -34,6 +40,10 @@ from typing import Optional
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from local_client import log, create_session, call_api, extract_complete_answer
+
+
+# Ctrl+C 后置位；各线程在每轮之间检查，尽快停下来
+STOP = threading.Event()
 
 
 @dataclass
@@ -59,6 +69,17 @@ def run_conversation(conv_id: str, turns: list) -> list:
         每一轮的 TurnResult 列表
     """
     results = []
+
+    if STOP.is_set():
+        return [
+            TurnResult(
+                conv_id=conv_id,
+                turn=turn,
+                question=question,
+                error="跳过：收到中断信号",
+            )
+            for turn, question in turns
+        ]
 
     try:
         session_id = create_session()
@@ -87,6 +108,11 @@ def run_conversation(conv_id: str, turns: list) -> list:
         if aborted:
             # 上一轮失败，上下文已断，后面几轮再发也没有意义
             result.error = "跳过：同一对话的前序轮次失败"
+            results.append(result)
+            continue
+
+        if STOP.is_set():
+            result.error = "跳过：收到中断信号"
             results.append(result)
             continue
 
@@ -264,17 +290,34 @@ def main():
     print(f"\n并发对话数: {max_workers}（同一对话内串行）")
     print(f"输出文件: {out_path}")
 
+    fieldnames = [
+        "conv_id",
+        "turn",
+        "question",
+        "answer",
+        "session_id",
+        "error",
+        "duration",
+    ]
+
     results = []
     done_count = 0
+    processed = set()
+    interrupted = False
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        fut_map = {
-            executor.submit(run_conversation, conv_id, turns): (conv_id, turns)
-            for conv_id, turns in conversations.items()
-        }
+    with open(out_path, "w", encoding="utf-8-sig", newline="") as out_file:
+        writer = csv.DictWriter(out_file, fieldnames=fieldnames)
+        writer.writeheader()
+        out_file.flush()
 
-        for fut in as_completed(fut_map):
-            conv_id, turns = fut_map[fut]
+        def handle_future(fut, conv_id, turns):
+            """收下一个对话的结果，立刻追加落盘，并打印进度。"""
+            nonlocal done_count
+
+            if fut in processed:
+                return
+
+            processed.add(fut)
 
             try:
                 conv_results = fut.result()
@@ -292,34 +335,78 @@ def main():
             results.extend(conv_results)
             done_count += 1
 
+            for r in conv_results:
+                writer.writerow(asdict(r))
+
+            # 每跑完一个对话就落盘，中途被打断也不会丢已完成的部分
+            out_file.flush()
+            os.fsync(out_file.fileno())
+
             ok = sum(1 for r in conv_results if not r.error)
             elapsed = sum(r.duration for r in conv_results)
 
             print(
                 f"  [{done_count}/{len(conversations)}] 对话{conv_id} 完成 "
-                f"{ok}/{len(conv_results)} 轮 ({elapsed:.1f}s)"
+                f"{ok}/{len(conv_results)} 轮 ({elapsed:.1f}s) 已落盘"
             )
 
-    fieldnames = [
-        "conv_id",
-        "turn",
-        "question",
-        "answer",
-        "session_id",
-        "error",
-        "duration",
-    ]
+        executor = ThreadPoolExecutor(max_workers=max_workers)
 
-    with open(out_path, "w", encoding="utf-8-sig", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
+        try:
+            fut_map = {
+                executor.submit(run_conversation, conv_id, turns): (conv_id, turns)
+                for conv_id, turns in conversations.items()
+            }
 
-        for r in sorted(results, key=lambda x: sort_key(x.conv_id, x.turn)):
-            writer.writerow(asdict(r))
+            try:
+                for fut in as_completed(fut_map):
+                    conv_id, turns = fut_map[fut]
+                    handle_future(fut, conv_id, turns)
+
+            except KeyboardInterrupt:
+                interrupted = True
+                STOP.set()
+
+                cancelled = sum(1 for f in fut_map if f.cancel())
+
+                print(
+                    f"\n收到中断信号：已取消 {cancelled} 个尚未开始的对话，"
+                    f"进行中的对话会在当前这一轮结束后停下……"
+                )
+
+                # 继续收尾：把进行中的对话已经跑出来的轮次也写进去
+                for fut, (conv_id, turns) in fut_map.items():
+                    if fut.cancelled():
+                        continue
+                    handle_future(fut, conv_id, turns)
+
+        finally:
+            executor.shutdown(wait=True)
+
+    # 追加时是按完成顺序写的，最后按 (对话ID, 轮次) 重排一次。
+    # 先写临时文件再原子替换，重排出问题也不会破坏已经落盘的数据。
+    try:
+        tmp_path = out_path + ".tmp"
+
+        with open(tmp_path, "w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+
+            for r in sorted(results, key=lambda x: sort_key(x.conv_id, x.turn)):
+                writer.writerow(asdict(r))
+
+        os.replace(tmp_path, out_path)
+
+    except Exception as e:
+        print(f"结果重排失败，文件保持完成顺序（数据未丢失）: {e}")
 
     success_count = sum(1 for r in results if not r.error)
 
-    print(f"\n结果已写入: {out_path}")
+    if interrupted:
+        print(f"\n已中断，部分结果已写入: {out_path}")
+    else:
+        print(f"\n结果已写入: {out_path}")
+
     print(f"成功: {success_count} / {len(results)} 轮")
 
     print("\n结果摘要")
