@@ -11,3 +11,4 @@ logs/
 
 # 测试结果输出
 fuzzy_results_*.csv
+multi_turn_results_*.csv
