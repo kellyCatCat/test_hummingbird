@@ -5,7 +5,7 @@
 
 用法：
     python online_test/fuzzy_test.py
-    python online_test/fuzzy_test.py --csv data/rewrite/question_fuzzy.csv --max_workers 4
+    python online_test/fuzzy_test.py --csv data/question_fuzzy.csv --max_workers 4
 """
 
 import argparse
@@ -79,8 +79,8 @@ def main():
 
     parser.add_argument(
         "--csv",
-        default="data/rewrite/question_fuzzy.csv",
-        help="CSV 文件路径，默认 data/rewrite/question_fuzzy.csv",
+        default="data/question_fuzzy.csv",
+        help="CSV 文件路径，默认 data/question_fuzzy.csv",
     )
 
     parser.add_argument(
