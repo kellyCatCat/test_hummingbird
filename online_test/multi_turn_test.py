@@ -120,7 +120,7 @@ def run_conversation(conv_id: str, turns: list) -> list:
 
         try:
             resp = call_api(
-                pod_name="anlynetmasterapp",
+                pod_name="hummingbird",
                 url_path="",
                 request_body={},
                 session_id=session_id,

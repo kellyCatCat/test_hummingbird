@@ -7,7 +7,7 @@
 通过 SSH 连接到远程服务器，执行 kubectl 命令在 Pod 中调用 蜂鸟
 
 使用说明
-1.调用接口需要指定 pod 名称，通常业务 api 和 sql 接口 pod 为 anlynetmasterapp
+1.调用接口需要指定 pod 名称，通常业务 api 和 sql 接口 pod 为 hummingbird
 2.SSH 连接信息通过环境变量配置，见 .env.example：
     export SSH_HOST=<右侧环境 ip>
     export SSH_PASSWORD=<sopuser 密码>
@@ -208,7 +208,7 @@ def parse_response(response: str) -> Dict[str, Any]:
 def call_api(
         url_path: str,
         request_body: Dict[str, Any],
-        pod_name: str = "anlynetmasterapp",
+        pod_name: str = "hummingbird",
         method: str = None,
         namespace: str = "nce",
         ssh_config: SSHConfig = None,
@@ -300,7 +300,7 @@ def call_api(
     return result
 
 
-def create_session(pod_name: str = "anlynetmasterapp", namespace: str = "nce") -> str:
+def create_session(pod_name: str = "hummingbird", namespace: str = "nce") -> str:
     """
     创建会话并返回 session_id
 
@@ -369,7 +369,7 @@ if __name__ == "__main__":
 
     # 2. 使用真实 session_id 调用流式消息 API
     results = call_api(
-        pod_name="anlynetmasterapp",
+        pod_name="hummingbird",
         url_path="",
         request_body={},
         session_id=session_id,
