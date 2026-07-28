@@ -167,6 +167,27 @@ def parse_sse_response(response: str) -> list:
     current_event = None
     current_data = []
 
+    def flush():
+        """把攒好的一个事件收进列表"""
+        nonlocal current_event, current_data
+
+        if current_event is None:
+            return
+
+        data_str = ''.join(current_data)
+        try:
+            data = json.loads(data_str)
+        except json.JSONDecodeError:
+            data = data_str
+
+        events.append({
+            'event': current_event,
+            'data': data
+        })
+
+        current_event = None
+        current_data = []
+
     for line in lines:
         if line.startswith('event:'):
             current_event = line[6:].strip()
@@ -174,18 +195,11 @@ def parse_sse_response(response: str) -> list:
             current_data.append(line[5:].strip())
         elif line == '':
             # 空行表示事件结束
-            if current_event is not None:
-                data_str = ''.join(current_data)
-                try:
-                    data = json.loads(data_str)
-                except json.JSONDecodeError:
-                    data = data_str
-                events.append({
-                    'event': current_event,
-                    'data': data
-                })
-                current_event = None
-                current_data = []
+            flush()
+
+    # 收尾：报文末尾不一定有空行（exec_as_root 对 stdout 做了 strip，
+    # 恰好会把结尾的空行剥掉），不补这一下会静默丢掉最后一个事件
+    flush()
 
     return events
 
@@ -293,6 +307,12 @@ def call_api(
 
         result = parse_response(response)
 
+        # 原始报文原样带出来，供调用方落盘排查。
+        # 用 _raw 而不是 raw_response 这个名字，是为了不和 parse_response
+        # 在非 SSE 分支里塞的 raw_response 撞车——create_session 拿后者当
+        # session_id 的兜底值，覆盖掉会返回一坨报文当 session_id。
+        result['_raw'] = response
+
     finally:
         client.close()
         log("SSH 连接已关闭")
@@ -357,6 +377,100 @@ def extract_complete_answer(result: dict) -> str:
 
     # 5. 将所有碎片拼接成一句话返回
     return "".join(full_answer)
+
+
+def _iter_stream_events(result: dict):
+    """遍历事件流里的 stream_event，产出内层的 event 对象"""
+    for item in result.get('events', []):
+        if item.get('event') != 'stream_event':
+            continue
+
+        inner = (item.get('data') or {}).get('event') or {}
+
+        if inner:
+            yield inner
+
+
+def extract_thinking(result: dict) -> str:
+    """
+    提取模型的思考过程并拼接成字符串。
+
+    思考走的也是 content_block_delta，但 delta 的 key 是 thinking 而不是 text，
+    所以 extract_complete_answer 取不到它。
+    """
+    parts = []
+
+    for inner in _iter_stream_events(result):
+        if inner.get('type') != 'content_block_delta':
+            continue
+
+        delta = inner.get('delta') or {}
+
+        if delta.get('type') == 'thinking_delta':
+            parts.append(delta.get('thinking', ''))
+
+    return "".join(parts)
+
+
+def extract_tool_calls(result: dict) -> str:
+    """
+    提取工具调用，序列化成 JSON 字符串，形如：
+        [{"name": "query_alarm", "input": {"ne": "小赵庄东"}}]
+
+    一次工具调用在事件流里由三部分组成：
+        content_block_start  content_block: {type: tool_use, name, input}
+        content_block_delta  delta: {type: input_json_delta, partial_json: "片段"}
+        content_block_stop
+    参数是分片下发的，要按 index 攒齐再拼成完整 JSON。
+
+    没有工具调用时返回空字符串。工具的返回结果格式因服务端而异，这里不做猜测，
+    需要时看 _raw 里的原始报文。
+    """
+    blocks = {}
+    order = []
+
+    for inner in _iter_stream_events(result):
+        etype = inner.get('type')
+        index = inner.get('index')
+
+        if etype == 'content_block_start':
+            block = inner.get('content_block') or {}
+
+            if block.get('type') == 'tool_use':
+                blocks[index] = {
+                    'name': block.get('name', ''),
+                    'input': block.get('input') or {},
+                    'fragments': [],
+                }
+                order.append(index)
+
+        elif etype == 'content_block_delta':
+            delta = inner.get('delta') or {}
+
+            if delta.get('type') == 'input_json_delta' and index in blocks:
+                blocks[index]['fragments'].append(delta.get('partial_json', ''))
+
+    calls = []
+
+    for index in order:
+        block = blocks[index]
+        raw_input = "".join(block['fragments'])
+
+        if raw_input:
+            try:
+                params = json.loads(raw_input)
+            except json.JSONDecodeError:
+                # 分片没拼完整就原样留着，总比丢掉强
+                params = raw_input
+        else:
+            params = block['input']
+
+        calls.append({'name': block['name'], 'input': params})
+
+    if not calls:
+        return ""
+
+    return json.dumps(calls, ensure_ascii=False)
 
 
 if __name__ == "__main__":

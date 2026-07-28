@@ -20,7 +20,14 @@ from typing import Optional
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from local_client import log, create_session, call_api, extract_complete_answer
+from local_client import (
+    log,
+    create_session,
+    call_api,
+    extract_complete_answer,
+    extract_thinking,
+    extract_tool_calls,
+)
 
 
 @dataclass
@@ -30,6 +37,9 @@ class QueryResult:
     column: str
     session_id: str = ""
     answer: str = ""
+    thinking: str = ""
+    tool_calls: str = ""
+    raw_response: str = ""
     error: Optional[str] = None
     duration: float = 0.0
 
@@ -52,6 +62,9 @@ def ask_once(question: str, row: int, column: str) -> QueryResult:
 
         answer = extract_complete_answer(resp)
         result.answer = answer
+        result.thinking = extract_thinking(resp)
+        result.tool_calls = extract_tool_calls(resp)
+        result.raw_response = resp.get("_raw", "")
 
     except Exception as e:
         result.error = str(e)
@@ -196,14 +209,18 @@ def main():
                     f"({res.duration:.1f}s)"
                 )
 
+    # raw_response 整段报文很长，放最后一列，前面几列才好读
     fieldnames = [
         "row",
         "column",
         "question",
         "answer",
+        "thinking",
+        "tool_calls",
         "session_id",
         "error",
         "duration",
+        "raw_response",
     ]
 
     with open(out_path, "w", encoding="utf-8-sig", newline="") as f:

@@ -39,7 +39,14 @@ from typing import Optional
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from local_client import log, create_session, call_api, extract_complete_answer
+from local_client import (
+    log,
+    create_session,
+    call_api,
+    extract_complete_answer,
+    extract_thinking,
+    extract_tool_calls,
+)
 
 
 # Ctrl+C 后置位；各线程在每轮之间检查，尽快停下来
@@ -53,6 +60,9 @@ class TurnResult:
     question: str
     session_id: str = ""
     answer: str = ""
+    thinking: str = ""
+    tool_calls: str = ""
+    raw_response: str = ""
     error: Optional[str] = None
     duration: float = 0.0
 
@@ -128,6 +138,9 @@ def run_conversation(conv_id: str, turns: list) -> list:
             )
 
             result.answer = extract_complete_answer(resp)
+            result.thinking = extract_thinking(resp)
+            result.tool_calls = extract_tool_calls(resp)
+            result.raw_response = resp.get("_raw", "")
 
         except Exception as e:
             result.error = str(e)
@@ -290,14 +303,18 @@ def main():
     print(f"\n并发对话数: {max_workers}（同一对话内串行）")
     print(f"输出文件: {out_path}")
 
+    # raw_response 整段报文很长，放最后一列，前面几列才好读
     fieldnames = [
         "conv_id",
         "turn",
         "question",
         "answer",
+        "thinking",
+        "tool_calls",
         "session_id",
         "error",
         "duration",
+        "raw_response",
     ]
 
     results = []
