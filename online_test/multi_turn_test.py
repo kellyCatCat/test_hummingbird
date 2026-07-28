@@ -16,6 +16,10 @@ CSV 为长表格式，一行一轮，必须包含「对话ID」「轮次」「�
 
 某一轮失败时，该对话的后续轮次不再发送（上下文已断），会标记为跳过。
 
+每轮的原始 SSE 报文单独存成一个 txt，放在与输出 CSV 同名的 _raw 目录下，
+CSV 里的 raw_file 列存相对路径（形如 multi_turn_results_xxx_raw/1_2.txt）。
+报文动辄几十 KB，直接塞进 CSV 会让表格没法看，Excel 单元格还有 32767 字符上限。
+
 结果是**边跑边落盘**：每个对话一跑完就追加写入输出 CSV 并 fsync，中途 Ctrl+C
 或进程被杀，已完成的对话都还在文件里。Ctrl+C 会取消尚未开始的对话，进行中的
 对话在当前这一轮结束后停下，其已完成轮次同样会写入。全部跑完后文件会按
@@ -29,6 +33,7 @@ CSV 为长表格式，一行一轮，必须包含「对话ID」「轮次」「�
 import argparse
 import csv
 import os
+import re
 import sys
 import threading
 import time
@@ -62,18 +67,47 @@ class TurnResult:
     answer: str = ""
     thinking: str = ""
     tool_calls: str = ""
-    raw_response: str = ""
+    raw_file: str = ""
     error: Optional[str] = None
     duration: float = 0.0
 
 
-def run_conversation(conv_id: str, turns: list) -> list:
+def safe_name(text: str) -> str:
+    """把任意文本压成能当文件名的形式"""
+    return re.sub(r"[^\w.-]", "_", str(text)) or "x"
+
+
+def dump_raw(raw: str, raw_dir: str, conv_id: str, turn: int) -> str:
+    """
+    把原始报文单独存成文件，返回相对输出 CSV 所在目录的路径。
+    报文动辄几十 KB，塞进 CSV 会让表格没法看，Excel 单元格还有 32767 字符上限。
+    """
+    if not raw:
+        return ""
+
+    filename = f"{safe_name(conv_id)}_{turn}.txt"
+
+    try:
+        os.makedirs(raw_dir, exist_ok=True)
+
+        with open(os.path.join(raw_dir, filename), "w", encoding="utf-8") as f:
+            f.write(raw)
+
+    except OSError as e:
+        log(f"[对话{conv_id}][第{turn}轮] 原始报文落盘失败: {e}")
+        return ""
+
+    return os.path.join(os.path.basename(raw_dir), filename)
+
+
+def run_conversation(conv_id: str, turns: list, raw_dir: str) -> list:
     """
     跑完一个完整对话：建一次 session，然后按轮次串行提问。
 
     Args:
         conv_id: 对话 ID
         turns: [(轮次, 查询), ...]，已按轮次升序排好
+        raw_dir: 原始报文的存放目录
 
     Returns:
         每一轮的 TurnResult 列表
@@ -140,7 +174,7 @@ def run_conversation(conv_id: str, turns: list) -> list:
             result.answer = extract_complete_answer(resp)
             result.thinking = extract_thinking(resp)
             result.tool_calls = extract_tool_calls(resp)
-            result.raw_response = resp.get("_raw", "")
+            result.raw_file = dump_raw(resp.get("_raw", ""), raw_dir, conv_id, turn)
 
         except Exception as e:
             result.error = str(e)
@@ -300,10 +334,13 @@ def main():
             f"multi_turn_results_{ts}.csv",
         )
 
+    # 原始报文放到和输出 CSV 同名的 _raw 目录里，CSV 里只存相对路径
+    raw_dir = os.path.splitext(out_path)[0] + "_raw"
+
     print(f"\n并发对话数: {max_workers}（同一对话内串行）")
     print(f"输出文件: {out_path}")
+    print(f"原始报文: {raw_dir}/")
 
-    # raw_response 整段报文很长，放最后一列，前面几列才好读
     fieldnames = [
         "conv_id",
         "turn",
@@ -314,7 +351,7 @@ def main():
         "session_id",
         "error",
         "duration",
-        "raw_response",
+        "raw_file",
     ]
 
     results = []
@@ -371,7 +408,7 @@ def main():
 
         try:
             fut_map = {
-                executor.submit(run_conversation, conv_id, turns): (conv_id, turns)
+                executor.submit(run_conversation, conv_id, turns, raw_dir): (conv_id, turns)
                 for conv_id, turns in conversations.items()
             }
 

@@ -11,6 +11,7 @@
 import argparse
 import csv
 import os
+import re
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -39,12 +40,40 @@ class QueryResult:
     answer: str = ""
     thinking: str = ""
     tool_calls: str = ""
-    raw_response: str = ""
+    raw_file: str = ""
     error: Optional[str] = None
     duration: float = 0.0
 
 
-def ask_once(question: str, row: int, column: str) -> QueryResult:
+def safe_name(text: str) -> str:
+    """把任意文本压成能当文件名的形式"""
+    return re.sub(r"[^\w.-]", "_", str(text)) or "x"
+
+
+def dump_raw(raw: str, raw_dir: str, row: int, column: str) -> str:
+    """
+    把原始报文单独存成文件，返回相对输出 CSV 所在目录的路径。
+    报文动辄几十 KB，塞进 CSV 会让表格没法看，Excel 单元格还有 32767 字符上限。
+    """
+    if not raw:
+        return ""
+
+    filename = f"{row}_{safe_name(column)}.txt"
+
+    try:
+        os.makedirs(raw_dir, exist_ok=True)
+
+        with open(os.path.join(raw_dir, filename), "w", encoding="utf-8") as f:
+            f.write(raw)
+
+    except OSError as e:
+        log(f"[行{row}][{column}] 原始报文落盘失败: {e}")
+        return ""
+
+    return os.path.join(os.path.basename(raw_dir), filename)
+
+
+def ask_once(question: str, row: int, column: str, raw_dir: str) -> QueryResult:
     result = QueryResult(row=row, question=question, column=column)
     t0 = time.time()
 
@@ -64,7 +93,7 @@ def ask_once(question: str, row: int, column: str) -> QueryResult:
         result.answer = answer
         result.thinking = extract_thinking(resp)
         result.tool_calls = extract_tool_calls(resp)
-        result.raw_response = resp.get("_raw", "")
+        result.raw_file = dump_raw(resp.get("_raw", ""), raw_dir, row, column)
 
     except Exception as e:
         result.error = str(e)
@@ -173,15 +202,19 @@ def main():
         print(f"--max_workers 必须大于 0，当前值: {max_workers}")
         sys.exit(1)
 
+    # 原始报文放到和输出 CSV 同名的 _raw 目录里，CSV 里只存相对路径
+    raw_dir = os.path.splitext(out_path)[0] + "_raw"
+
     print(f"\n并发数: {max_workers}, 任务总数: {len(tasks)}")
     print(f"输出文件: {out_path}")
+    print(f"原始报文: {raw_dir}/")
 
     results: list[QueryResult] = []
     done_count = 0
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         fut_map = {
-            executor.submit(ask_once, question, row, col): (question, row, col)
+            executor.submit(ask_once, question, row, col, raw_dir): (question, row, col)
             for question, row, col in tasks
         }
 
@@ -209,7 +242,6 @@ def main():
                     f"({res.duration:.1f}s)"
                 )
 
-    # raw_response 整段报文很长，放最后一列，前面几列才好读
     fieldnames = [
         "row",
         "column",
@@ -220,7 +252,7 @@ def main():
         "session_id",
         "error",
         "duration",
-        "raw_response",
+        "raw_file",
     ]
 
     with open(out_path, "w", encoding="utf-8-sig", newline="") as f:
